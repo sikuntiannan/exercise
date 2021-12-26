@@ -1,4 +1,4 @@
-﻿#include"../inc/error.h"
+﻿#include"error.h"
 
 #include<unordered_map>
 
