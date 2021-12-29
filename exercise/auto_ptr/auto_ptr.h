@@ -2,7 +2,7 @@
 #include<def.h>
 #include<atomic>
 #include<compare>
-
+#include<cassert>
 /*
 * @author tiannan
 * @note 参文档
@@ -31,7 +31,8 @@ namespace __private
 		size_t WeakSub( )noexcept;
 		size_t GetShared( )noexcept;
 		size_t GetWeak( )noexcept;
-
+		bool CompareExchange(T *, T *)noexcept;
+		T *Exchange(T *)noexcept;
 	private:
 		const std::atomic<T *> m_data;
 		std::atomic<size_t> m_SharedCounter;
@@ -53,7 +54,13 @@ namespace __private
 	template<typename T>
 	Node<T>::~Node( )
 	{
-		delete m_data.load( );
+		#ifdef _DEBUG
+		if (m_data.load( ) == nullptr)
+		{
+			assert(false);//不应该执行到这里，如果有就是我代码写的有问题。
+			delete m_data.load( );
+		}
+		#endif // _DEBUG
 	}
 
 	template<typename T>
@@ -109,6 +116,19 @@ namespace __private
 	{
 		return m_WeakCounter.load( );
 	}
+
+	template<typename T>
+	bool Node<T>::CompareExchange(T *expected , T *desired)noexcept
+	{
+		return m_data.compare_exchange_weak(expected , desired);
+	}
+
+	template<typename T>
+	T *Node<T>::Exchange(T *aim)noexcept
+	{
+		return m_data.exchange(aim)
+	}
+
 }
 
 namespace dz
@@ -151,17 +171,20 @@ namespace dz
 	shared_ptr<T> weak_ptr<T>::Lock( )const noexcept
 	{
 		__private::Node<T> *NodePtr = m_NodePtr.load( );
-		size_t Uses = NodePtr->SharedAdd( );
-		if (!Uses)
+		if (NodePtr)
 		{
-			return shared_ptr<T>( );
+			size_t OldUses = NodePtr->SharedAdd( );
+			if (OldUses > 0)
+			{
+				if (NodePtr->get( ))
+				{
+					return shared_ptr<T>(NodePtr);
+				}
+			}
+			NodePtr->SharedSub( );
 		}
-		else
-		{
-			return shared_ptr<T>(NodePtr);
-		}
+		return shared_ptr<T>( );
 	}
-
 	template<typename T>
 	bool weak_ptr<T>::expired( )const noexcept
 	{
@@ -195,6 +218,7 @@ namespace dz
 		shared_ptr(T *);
 		std::atomic < __private::Node<T> *> m_node;
 	};
+
 	template<typename T>
 	shared_ptr<T>::shared_ptr( )
 		:m_node(nullptr)
@@ -232,13 +256,17 @@ namespace dz
 	template<typename T>
 	shared_ptr<T>::~shared_ptr( )
 	{
-		if (!m_node.load( ))
+		__private::Node<T> *NodePtr = m_node.load( );
+		if (NodePtr)
 		{
-			__private::Node<T> *NodePtr = m_node.load( );
-			size_t OldPtrCounter = NodePtr->sub( );
-			if ((OldPtrCounter == 1) && (NodePtr->GetWeak()==0))
+			size_t OldPtrCounter = NodePtr->SharedSub( );
+			if (OldPtrCounter == 1)
 			{
-				delete NodePtr;
+				delete NodePtr->Exchange(nullptr);
+				if ((NodePtr->GetWeak( ) == 0))
+				{
+					delete NodePtr;
+				}
 			}
 		}
 	}
@@ -246,10 +274,13 @@ namespace dz
 	template<typename T>
 	shared_ptr<T> &shared_ptr<T>::operator=(const shared_ptr<T> &aim) noexcept
 	{
-		Node *NewValue = aim.m_node.load( );
-		Node *OldValue = m_node.load( );
-		NewValue->add( );
-		size_t OldPtrCounter = OldValue->sub( );
+		__private::Node<T> *NewValue = aim.m_node.load( );
+		__private::Node<T> *OldValue = m_node.load( );
+		if (NewValue)
+		{
+			NewValue->SharedAdd( );
+		}
+		size_t OldPtrCounter = OldValue->SharedSub( );
 		m_node.store(NewValue);
 		if (OldPtrCounter == 1)
 		{
@@ -285,16 +316,20 @@ namespace dz
 	template<typename T>
 	shared_ptr<T> shared_ptr<T>::exchange(const shared_ptr<T> &aim)noexcept
 	{
-		Node *NewValue = aim.m_node.load( );
-		Node *OldValue = m_node.load( );
-		NewValue->add( );
-		size_t OldPtrCounter = OldValue->sub( );
+		__private::Node<T> *NewValue = aim.m_node.load( );
+		__private::Node<T> *OldValue = m_node.load( );
+		if (NewValue)
+		{
+			NewValue->SharedAdd( );
+		}
+		size_t OldPtrCounter = OldValue->SharedSub( );
 		m_node.store(NewValue);
 		if (OldPtrCounter == 1)
 		{
 			delete OldValue;
 		}
 		return *this;
+		
 	}
 
 	template<typename T>
@@ -302,15 +337,19 @@ namespace dz
 	{
 		if (expected.m_node == m_node)
 		{
-			Node *NewValue = desired.m_node.load( );
-			Node *OldValue = m_node.load( );
-			NewValue->add( );
-			size_t OldPtrCounter = OldValue->sub( );
+			__private::Node<T> *NewValue = desired.m_node.load( );
+			__private::Node<T> *OldValue = m_node.load( );
+			if (NewValue)
+			{
+				NewValue->SharedAdd( );
+			}
+			size_t OldPtrCounter = OldValue->SharedSub( );
 			m_node.store(NewValue);
 			if (OldPtrCounter == 1)
 			{
 				delete OldValue;
 			}
+			return true;
 		}
 		else
 		{
