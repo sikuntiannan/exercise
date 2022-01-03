@@ -1,86 +1,150 @@
-# 理念
+# 前提
 
-因为B先于A获取，只是执行偏后，智能指针只负责指针本身的安全性而不负责持有对象的安全。
+假设你知道std::shared_ptr和std::weak_ptr的用法和可能的实现方式。
 
-当然，如果存心要崩溃，那这个代码是防止不了的，比如获取持有的对象，然后取地址，之后delete，我也没办法。
+假设你有并发程序编写经验和一定的推理想象能力。
 
-## 细节
+# 概述
 
- - 移动构造
+线程安全的智能指针。
 
-   ```c++
-   	template<typename T>
-   	shared_ptr<T>::shared_ptr(shared_ptr<T> &&aim)
-   		:m_node(nullptr)
-   	{
-   		std::swap(m_node , aim.m_node);
-   	}
-   ```
+ - 不保证多个线程操作指针指向的对象是安全的
+ - 保证多个线程对指针的操作是线程安全的
 
-   - 这里不会引起释放
+##### 特性： 无锁、无阻塞、无循环。
 
-   - 存在这一种特殊情况
+**依赖变量修改的顺序**保证指针是类型安全的
 
-     | A                               | B                     |
-     | ------------------------------- | --------------------- |
-     | :m_node(nullptr)                |                       |
-     |                                 | 获取指针 auto ptr =*B |
-     | std::swap(m_node , aim.m_node); |                       |
-     |                                 | ptr ->function()      |
+# 函数简述
 
-     这是合理的
+* shared_ptr
 
- - 拷贝构造
+  * 对外部有影响的
 
-   ```c++
-   	template<typename T>
-   	shared_ptr<T>::shared_ptr(const shared_ptr<T> &aim)
-   		:m_node(aim.m_node)
-   	{
-   		m_node.load( )->add( );
-   	}
-   ```
+    * ~shared_ptr()
 
-    - 这里不会引起释放
+      ```c++
+      /*
+      	因为对象的释放取决于有没有shard_ptr持有它，但shared_ptr析构对象时，可能会有weak_ptr持有，所以这里有对外部的影响。
+      */
+      ```
 
-    - 一些特殊情况
+      
 
-      | A                       | B              |
-      | ----------------------- | -------------- |
-      | :m_node(aim.m_node)     |                |
-      |                         | delete m_node; |
-      | m_node.load( )->add( ); |                |
+     - 对外部无影响的
 
-      这种情况并不会发生，因为这个函数本身就已经持有一个shared_ptr，且m_node并不会泄露，所以不会有释放操作。
+       - shared_ptr(......)
 
-   
+         ```c++
+         /*
+         	这里仅仅支持从shared_ptr构造shared_ptr，所以无论怎样持有的对象都一定存在；且因为shared_ptr只有一个成员数据，所以这里不会出现不安全（不能原子修改）的情况。
+         */
+         ```
 
- - 赋值
+       - operator=(......)
 
- - 其他操作对访问操作
+         ```c++
+         /*
+         	因为这里是拷贝赋值，目标值一定是赋值安全，因为被赋值可能引发对象析构，这里使用~shared_ptr()的实现，所以上半部分是安全的，下半部分是安全的，中间交替部分是上下无关的。所以总体线程安全
+         	
+         */
+         ```
 
- - 获取操作
+       - exchange(......)
 
- - 重置操作
+         ```c++
+         /*
+         	这里实际也是拷贝赋值，故与上同理，所以也安全。
+         */
+         ```
 
-```c++
-	template<typename T>
-	shared_ptr<T> &shared_ptr<T>::operator=(const shared_ptr<T> &aim) noexcept
-	{
-		Node *NewValue = aim.m_node.load( );
-		Node *OldValue = m_node.load( );
-		NewValue->add( );
-		size_t OldPtrCounter = OldValue->sub( );
-		m_node.store(NewValue);
-		if (OldPtrCounter == 1)
-		{
-			delete OldValue;
-		}
-		return *this;
-	}
-```
+       - compare_exchange(......)
 
+         ```c++
+         /*
+         	这里是比较赋值，比较时相等就修改shared_ptr。但这里的shared_ptr是局部变量，也只是对一个shared_ptr修改，所以不会影响到其他的shared_ptr，哪怕持有了同一个对象。
+         */
+         ```
 
+* weak_ptr
 
+  * 对外部有影响的
 
+    * Lock( )
 
+  * 对外部无影响的
+
+    * weak_ptr()
+
+      ```c++
+      /*
+      	从node构造一个weak_ptr
+      */
+      ```
+
+      
+
+    * ~weak_ptr( )
+
+      ```c++
+      /*
+      	析构这个对象，如果weak counter已经为零，且shared counter也为零，则释放节点。
+      */
+      ```
+
+      
+
+    * expired( )
+
+      ```c++
+      /*
+      	返回是否有效，返回这一刻所持有的节点的shared_ptr是否为零。注意：这一刻，即函数返回后这个值有可能已经失效了。
+      */
+      ```
+
+# 一些竞争情况的说明
+
+可能出错的就是释放和创建交错的情况。
+
+- shared_ptr
+
+  - 一个对象两个线程用，是不会出错的，但如果两个线程中**有一方析构一方使用**，这种**错误不负责**，因为这是代码设计问题，不是指针能解决的。因为无论以何种线性顺序看待这个问题，最终都是程序错误，所以这个错误不负责。
+    - 一个线程修改，一个线程使用，这个也是不保证的，因为修改可以导致持有对象被析构（按照代码本身的逻辑，这里本身就是有问题的（释放和使用的不确定））。使用指针应该严格保证线程有对象的所有权（是否独占是对象自己的事情）
+    - 两个线程同时使用，这个因为返回对象的指针或引用时是只读情况，所以这是安全的。
+
+- weak_prt
+
+  lock和析构可能会影响到shard_ptr或者影响到其他weak_prt。
+
+  
+
+  |      | weak                                                         | shared                  |                  |
+  | ---- | ------------------------------------------------------------ | ----------------------- | ---------------- |
+  |      | ~weak_ptr                                                    | operator weak_ptr<T>( ) |                  |
+  |      | size_t Uses = NodePtr->WeakSub( );                           |                         |                  |
+  |      |                                                              | ~shared_ptr()           |                  |
+  |      |                                                              | 无其他shared_ptr        | 有其他shared_ptr |
+  |      | if (NodePtr->GetShared()\|\| (Uses == 1))                    |                         |                  |
+  |      | NodePtr->GetWeak( ) ?                                        |                         |                  |
+  |      | 无其他shared_ptr：且无其他weak_ptr故delete NodePtr;           有其他shared_ptr：返回函数，不进行释放node |                         |                  |
+  
+  |      | weak                  | shared                |
+  | ---- | --------------------- | --------------------- |
+  |      | Lock( )               | ~shared_ptr( )        |
+  |      | NodePtr->SharedAdd( ) |                       |
+  |      |                       | NodePtr->SharedSub( ) |
+  |      |                       | OldPtrCounter == 2    |
+  |      | OldUses == 1          |                       |
+  |      | 此处获取成功          | 不析构持有的对象      |
+  
+  |      | weak                     | shared                |
+  | ---- | ------------------------ | --------------------- |
+  |      | Lock( )                  | ~shared_ptr( )        |
+  |      |                          | NodePtr->SharedSub( ) |
+  |      | NodePtr->SharedAdd( )    | OldPtrCounter == 1    |
+  |      | OldUses == 0             |                       |
+  |      | 此处获取失败，返回空指针 | 析构持有对象          |
+  
+  **原子操作在硬件上是有线性化约束的，一个原子操作是不会有真正意义上的并发。**
+
+综上，是安全的。

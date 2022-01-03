@@ -163,7 +163,7 @@ namespace dz
 		size_t Uses = NodePtr->WeakSub( );
 		if (NodePtr->GetShared() || (Uses == 1))
 		{
-			delete NodePtr;
+			NodePtr->GetWeak( ) ? : delete NodePtr;
 		}
 	}
 
@@ -206,6 +206,7 @@ namespace dz
 		shared_ptr<T> &operator=(const shared_ptr &)noexcept;
 		std::weak_ordering operator<=> (const shared_ptr &right)const noexcept;
 		explicit operator bool( )const noexcept;
+		operator weak_ptr<T>( )const noexcept;
 		T &operator*( )const noexcept;
 		T *operator->( )const noexcept;
 		shared_ptr<T> exchange(const shared_ptr &)noexcept;
@@ -215,6 +216,7 @@ namespace dz
 		template<typename T , typename ...Types>
 		friend shared_ptr<T> make_shared(Types ...args);
 	private:
+		void release(__private::Node<T> *NodePtr = nullptr);
 		shared_ptr(T *);
 		std::atomic < __private::Node<T> *> m_node;
 	};
@@ -227,23 +229,21 @@ namespace dz
 	}
 
 	template<typename T>
-	shared_ptr<T>::shared_ptr(__private::Node<T> * ptr)
+	shared_ptr<T>::shared_ptr(__private::Node<T> *ptr)
 		:m_node(ptr)
 	{
-
-	}
-
-	template<typename T>
-	shared_ptr<T>::shared_ptr( )
-		:m_node(nullptr)
-	{
+		if (ptr != nullptr)
+		{
+			ptr->SharedAdd( );
+		}
 	}
 
 	template<typename T>
 	shared_ptr<T>::shared_ptr(const shared_ptr<T> &aim)
 		:m_node(aim.m_node)
 	{
-		m_node.load( )->add( );
+		__private::Node<T> *NodePtr = m_node.load( );
+		NodePtr->SharedAdd( );
 	}
 
 	template<typename T>
@@ -256,35 +256,22 @@ namespace dz
 	template<typename T>
 	shared_ptr<T>::~shared_ptr( )
 	{
-		__private::Node<T> *NodePtr = m_node.load( );
-		if (NodePtr)
-		{
-			size_t OldPtrCounter = NodePtr->SharedSub( );
-			if (OldPtrCounter == 1)
-			{
-				delete NodePtr->Exchange(nullptr);
-				if ((NodePtr->GetWeak( ) == 0))
-				{
-					delete NodePtr;
-				}
-			}
-		}
+		release(m_node.load());
 	}
 
 	template<typename T>
 	shared_ptr<T> &shared_ptr<T>::operator=(const shared_ptr<T> &aim) noexcept
 	{
-		__private::Node<T> *NewValue = aim.m_node.load( );
-		__private::Node<T> *OldValue = m_node.load( );
-		if (NewValue)
+		if (aim != *this)
 		{
-			NewValue->SharedAdd( );
-		}
-		size_t OldPtrCounter = OldValue->SharedSub( );
-		m_node.store(NewValue);
-		if (OldPtrCounter == 1)
-		{
-			delete OldValue;
+			__private::Node<T> *NewValue = aim.m_node.load( );
+			__private::Node<T> *OldValue = m_node.load( );
+			if (NewValue)
+			{
+				NewValue->SharedAdd( );
+			}
+			m_node.store(NewValue);
+			release(OldValue);
 		}
 		return *this;
 	}
@@ -302,6 +289,12 @@ namespace dz
 	}
 
 	template<typename T>
+	shared_ptr<T>::operator weak_ptr<T>( )const noexcept
+	{
+		return weak_ptr<T>(m_node);
+	}
+
+	template<typename T>
 	T &shared_ptr<T>::operator*( )const noexcept
 	{
 		return *(m_node.load( ));
@@ -316,44 +309,45 @@ namespace dz
 	template<typename T>
 	shared_ptr<T> shared_ptr<T>::exchange(const shared_ptr<T> &aim)noexcept
 	{
-		__private::Node<T> *NewValue = aim.m_node.load( );
-		__private::Node<T> *OldValue = m_node.load( );
-		if (NewValue)
+		if (aim != *this)
 		{
-			NewValue->SharedAdd( );
-		}
-		size_t OldPtrCounter = OldValue->SharedSub( );
-		m_node.store(NewValue);
-		if (OldPtrCounter == 1)
-		{
-			delete OldValue;
-		}
-		return *this;
-		
-	}
-
-	template<typename T>
-	bool shared_ptr<T>::compare_exchange(const shared_ptr<T> &expected , const shared_ptr<T> &desired)
-	{
-		if (expected.m_node == m_node)
-		{
-			__private::Node<T> *NewValue = desired.m_node.load( );
+			__private::Node<T> *NewValue = aim.m_node.load( );
 			__private::Node<T> *OldValue = m_node.load( );
 			if (NewValue)
 			{
 				NewValue->SharedAdd( );
 			}
-			size_t OldPtrCounter = OldValue->SharedSub( );
 			m_node.store(NewValue);
-			if (OldPtrCounter == 1)
+			release(OldValue);
+		}
+		return *this;
+	}
+
+	template<typename T>
+	bool shared_ptr<T>::compare_exchange(const shared_ptr<T> &expected , const shared_ptr<T> &desired)
+	{
+		if (desired != *this)
+		{
+			if (expected == *this)
 			{
-				delete OldValue;
+				__private::Node<T> *NewValue = desired.m_node.load( );
+				__private::Node<T> *OldValue = m_node.load( );
+				if (NewValue)
+				{
+					NewValue->SharedAdd( );
+				}
+				m_node.store(NewValue);
+				release(OldValue);
+				return true;
 			}
-			return true;
+			else
+			{
+				return false;
+			}
 		}
 		else
 		{
-			return false;
+			return true;
 		}
 	}
 
@@ -361,6 +355,23 @@ namespace dz
 	void shared_ptr<T>::swap(shared_ptr<T> &aim) noexcept
 	{
 		std::swap(m_node , aim.m_node);
+	}
+
+	template<typename T>
+	void shared_ptr<T>::release(__private::Node<T> *NodePtr)
+	{
+		if (NodePtr)
+		{
+			size_t OldPtrCounter = NodePtr->SharedSub( );
+			if (OldPtrCounter == 1)
+			{
+				delete NodePtr->Exchange(nullptr);
+				if ((NodePtr->GetWeak( ) == 0))
+				{
+					delete NodePtr;
+				}
+			}
+		}
 	}
 
 	template<typename T>
